@@ -29,7 +29,7 @@ def prep_for_iter_proj(X11, X21, idx_1_to_2_init):
     # Ray image
     rays_img = F.normalize(X11, dim=-1)
     rays_img = rays_img.permute(0, 3, 1, 2)  # (b,c,h,w)
-    gx_img, gy_img = img_utils.img_gradient(rays_img)
+    gx_img, gy_img = img_utils.img_gradient(rays_img) # get gradient of ray image for LM/GN updates
     rays_with_grad_img = torch.cat((rays_img, gx_img, gy_img), dim=1)
     rays_with_grad_img = rays_with_grad_img.permute(
         0, 2, 3, 1
@@ -39,7 +39,7 @@ def prep_for_iter_proj(X11, X21, idx_1_to_2_init):
     X21_vec = X21.view(b, -1, 3)
     pts3d_norm = F.normalize(X21_vec, dim=-1)
 
-    # Initial guesses of projections
+    # Initial guesses of projections: if not provided, use identity mapping (i.e. assume points are already matched)
     if idx_1_to_2_init is None:
         # Reset to identity mapping
         idx_1_to_2_init = torch.arange(h * w, device=device)[None, :].repeat(b, 1)

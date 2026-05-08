@@ -81,6 +81,13 @@ model = load_mast3r(device=device)
 model.share_memory()  # 多进程共享
 ```
 
+- [ ] **Question：** `model.share_memory()` 的作用是什么？是如何实现的？
+
+- [x] **Answer：**
+`main.py` 在 `load_mast3r()` 后、启动 backend 前调用 `model.share_memory()`（`main.py:196-197, 225`）。它的作用是让 `Module` 参数/缓冲区尽量进入进程共享内存，降低多进程重复拷贝。实现上会递归调用参数和 buffer 的 `Tensor.share_memory_()`。  
+但本项目模型先被放到 GPU（`mast3r_utils.py:20`），对 CUDA tensor 这一步基本是 no-op；项目里真正跨进程共享的大数据主要是 `SharedStates/SharedKeyframes` 里显式 `share_memory_()` 的张量。
+
+
 #### 3.1.2 三进程架构
 
 **前端进程（主进程）：**
@@ -97,6 +104,17 @@ model.share_memory()  # 多进程共享
 **可视化进程 (`run_visualization`)：**
 - 实时显示相机轨迹和 3D 点云
 - 提供交互控制（暂停/继续/退出）
+
+- [ ] **Question：** 前后端进程是如何同步的？使用了哪些机制来保证数据一致性和线程安全？
+
+- [x] **Answer：**
+前后端同步是“共享内存 + 锁 + 状态队列/标志位”的组合：
+1. 共享数据：`SharedStates` 和 `SharedKeyframes` 预分配并 `share_memory_()`（`frame.py:144-153, 234-247`）。
+2. 互斥：两者都用 `manager.RLock()`，读写都在 `with self.lock`（`frame.py:131, 222` 及各接口）。
+3. 状态同步：`mode/paused/reloc_sem/global_optimizer_tasks/edges` 用 `manager.Value/list`（`frame.py:132-138`），主/后端循环轮询推进（`main.py:82-143, 288-305`）。
+4. UI 同步：可视化消息走 `manager.Queue`（`multiprocess_utils.py:26-29`, `visualization.py:332,445`, `main.py:167-168,235`）。
+5. 关键临界区：重定位时 `with keyframes.lock` 包住 append/回滚，避免并发冲突（`main.py:31-64`）。
+
 
 #### 3.1.3 系统状态机
 
@@ -153,6 +171,14 @@ class Frame:
 
 #### 3.2.2 SharedKeyframes 类
 
+- [ ] **Question：** 关键帧放在多进程的作用是什么？
+
+- [x] **Answer：**
+关键帧放到多进程共享内存的作用是让前端、后端、可视化读写同一份关键帧数据，避免频繁拷贝大规模点云/特征：
+- 前端持续追加关键帧并更新最近关键帧（`main.py:298-299`, `tracker.py:99-101`）。
+- 后端直接读取这些关键帧构图优化，并回写优化位姿（`global_opt.py:31-39, 157-159, 213`）。
+- 可视化进程直接读取同一缓冲区，仅刷新 dirty 关键帧（`visualization.py:133-137`）。
+
 **功能：** 多进程共享的关键帧缓冲区
 
 **关键特性：**
@@ -160,6 +186,15 @@ class Frame:
 - 预分配固定大小的缓冲区（默认 512 帧）
 - 使用 `share_memory_()` 实现 zero-copy 共享
 - 提供线程安全的读写接口（使用 RLock）
+- [ ] **Question：** 这里的具体实现方式是什么？相关代码有哪些？
+
+- [x] **Answer：**
+`SharedKeyframes` 的实现是“固定容量共享张量池 + 线程安全访问”：
+- 构造时一次性分配 `img/T_WC/X/C/feat/pos/...` 并 `share_memory_()`（`frame.py:220-248`）。
+- `n_size = manager.Value("i", 0)` 管理当前有效长度（`frame.py:223, 291-293`）。
+- `__getitem__` 从共享张量切片组装 `Frame`；`__setitem__` 原位写回并置 `is_dirty`（`frame.py:250-289`）。
+- `append()` 基于 `n_size` 追加；后端用 `update_T_WCs()` 批量回写位姿（`frame.py:295-312`）。
+- 全部接口都在同一把 `RLock` 下执行（`frame.py:222` + 各方法 `with self.lock`）。
 
 **核心方法：**
 - `append(frame)`: 添加新关键帧
@@ -177,6 +212,8 @@ class Frame:
 - 当前帧与最近关键帧的匹配
 - 基于匹配进行位姿估计（帧到关键帧）
 - 关键帧选择策略
+
+
 
 #### 3.3.2 追踪流程 (tracker.py:28-127)
 
@@ -207,6 +244,35 @@ def track(self, frame: Frame):
     return new_kf, match_info, try_reloc
 ```
 
+- [ ] **Question：** 我想看到匹配的核心代码及其原理；
+
+- [x] **Answer：**
+核心是 `matching.py::match_iterative_proj()` + CUDA `matching_kernels.cu::iter_proj_kernel`：
+```python
+# matching.py
+rays_img = F.normalize(X11, dim=-1)
+gx_img, gy_img = img_utils.img_gradient(rays_img)
+p1, valid_proj2 = mast3r_slam_backends.iter_proj(
+    rays_with_grad_img, pts3d_norm, p_init, max_iter, lambda_init, convergence_thresh
+)
+dists2 = torch.linalg.norm(X11[p1]-X21, dim=-1)
+valid_proj2 = valid_proj2 & (dists2 < dist_thresh)
+if radius > 0:
+    (p1,) = mast3r_slam_backends.refine_matches(D11, D21, p1, radius, dilation_max)
+```
+原理：把目标点方向 `pts3d_norm` 对齐到参考视角射线场 `r(u,v)`，最小化 `||r(u,v)-pts3d_norm||^2`。CUDA 内使用 `gx, gy` 构造 2x2 LM/GN 更新 `(u,v)`（`matching_kernels.cu:200-215`），并用 `lambda` 做步长接受/拒绝（`259-268`）。
+
+- **Question：** 代码中的各个变量含义如下：
+    - `X11`: 参考帧的 3D 点云 (HW x 3)
+    - `X21`: 待匹配帧的 3D 点云 (HW x 3)
+    - `rays_img`: 参考帧的单位射线场 (HxWx3)
+    - `gx_img, gy_img`: 射线场的梯度 (HxWx3)
+    - `pts3d_norm`: 待匹配点云的单位向量 (HW x 3)
+    - `p_init`: 初始像素位置 (HW x 2)，标识匹配关系
+    - `p1`: 优化后的像素位置 (HW x 2)，对应 `X11[p1]` 是匹配到的参考帧点
+    - `valid_proj2`: 优化收敛且距离合理的匹配掩码 (HW)
+
+
 #### 3.3.3 两种位姿优化模式
 
 **无标定模式 (opt_pose_ray_dist_sim3):**
@@ -218,6 +284,8 @@ def track(self, frame: Frame):
   ```
 - **权重**: `sqrt_info = 1/sigma * sqrt(Q_confidence)`
 
+
+
 **有标定模式 (opt_pose_calib_sim3):**
 - **残差**: 像素重投影 + 深度
 - **优化变量**: Sim(3) 相对位姿 `T_CkCf`
@@ -228,6 +296,16 @@ def track(self, frame: Frame):
   r = z_k - h(X_f)
   ```
 - **约束**: 3D 点被约束到反投影射线上
+
+
+- [ ] **Question：** 有无标定带来了什么样的优化区别？
+
+- [x] **Answer：**
+有无标定对应两套不同测量模型：
+1. 无标定：`opt_pose_ray_dist_sim3`，残差是射线+距离（4 维），不需要内参 K（`tracker.py:173-193`）。
+2. 有标定：`opt_pose_calib_sim3`，残差是 `[u,v,log z]`（3 维），使用 `project_calib` 和内参 K，并检查投影有效性（`tracker.py:229-245`, `geometry.py:63-104`）。
+3. 噪声权重也不同：无标定用 `sigma_ray/sigma_dist`，有标定用 `sigma_pixel/sigma_depth`（`tracker.py:175-177` vs `220-223`）。
+4. 后端同样分为 `gauss_newton_rays` 与 `gauss_newton_calib` 两条路径（`global_opt.py:140-155, 190-210`）。
 
 **Gauss-Newton 求解器 (tracker.py:156-171):**
 ```python
@@ -247,6 +325,20 @@ def solve(self, sqrt_info, r, J):
     # 4. 在流形上更新
     T_CkCf = T_CkCf.retr(tau)
 ```
+
+- [ ] **Question：** 流形上更新需要用到`lietorch`吗？具体是如何实现的,show me the code.
+
+- [x] **Answer：**
+需要，项目直接用 `lietorch.Sim3` 做流形更新。关键代码在 `tracker.py`：
+```python
+T_CkCf = T_WCk.inv() * T_WCf
+...
+tau_ij_sim3, new_cost = self.solve(sqrt_info, r, J)   # 7维增量
+T_CkCf = T_CkCf.retr(tau_ij_sim3)                     # 在 Sim(3) 流形上更新
+...
+T_WCf = T_WCk * T_CkCf
+```
+其中 `retr()` 就是 Lie 群上的 retraction（不是欧式直接相加）。
 
 ---
 
@@ -304,6 +396,9 @@ def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
 - 点云约束到相机射线
 - 使用像素重投影 + 深度作为残差
 
+- [ ] 这里两种优化的具体C++/CUDA实现是什么样的？show me the code with comments.
+
+
 ---
 
 ### 3.5 MASt3R 模型接口 (mast3r_utils.py)
@@ -351,9 +446,28 @@ X, C, D, Q = mast3r_symmetric_inference(model, frame_i, frame_j)
 # 输出: Xii, Xji, Xjj, Xij（四个视角的 3D 预测）
 ```
 
+- [ ] **Question：** 这两种推理输出的形状是什么样的？特别是X。
+
+- [x] **Answer：**
+按 `mast3r_utils.py` 当前实现：
+- 非对称 `mast3r_asymmetric_inference`：`X.shape = [2, H, W, 3]`，对应 `Xii, Xji`（`mast3r_utils.py:184-206`）。
+- 对称 `mast3r_symmetric_inference`：`X.shape = [4, H, W, 3]`，对应 `Xii, Xji, Xjj, Xij`（`mast3r_utils.py:56-79`）。
+- 若走 batch 解码 `mast3r_decode_symmetric_batch`：`X.shape = [4, B, H, W, 3]`（`mast3r_utils.py:84-115`）。
+- 在追踪里又会 flatten 到 `[2, HW, 3]`（`mast3r_utils.py:226-229`）。
+
+
 **特征缓存优化：**
 - 每个帧的特征 `feat` 和位置 `pos` 只编码一次
 - 解码器可以重复使用缓存的特征
+
+- [ ] **Question：** 这里的具体实现方式是什么？相关代码有哪些？
+
+- [x] **Answer：**
+特征缓存是“懒编码 + 帧内持久化复用”：
+- `Frame` 有 `feat/pos` 字段用于缓存（`frame.py:27-28`）。
+- mono/asymmetric/symmetric 三类推理都先判断 `if frame.feat is None`，只在第一次编码，后续直接复用（`mast3r_utils.py:57-64, 120-122, 185-192`）。
+- 后端 `add_factors()` 直接读取关键帧缓存的 `kf.feat/kf.pos` 组批，不重新编码（`global_opt.py:33-38`）。
+- `SharedStates/SharedKeyframes` 也把 `feat/pos` 放入共享内存，跨进程直接读（`frame.py:152-153, 244-245`）。
 
 ---
 
@@ -394,6 +508,16 @@ def match_iterative_proj(X11, X21, D11, D21, idx_init):
 - 使用 Gauss-Newton 方法最小化点到射线的距离
 - 利用射线场的梯度加速收敛
 
+- [ ] **Question：** 射线场的梯度是怎么用的？数学原理是什么，相关代码又是如何实现的？
+
+- [x] **Answer：**
+数学上是在像素平面优化 `(u,v)`，目标是最小化 `||r(u,v)-x_hat||^2`。对 `r(u,v)` 一阶线性化后，雅可比就是 `[gx, gy]`（分别是对 `u,v` 的梯度），再解 `(J^T J + lambda I) delta = -J^T e`。
+
+代码对应关系：
+- Python 侧构造 `rays_img`，并计算 `gx_img, gy_img` 后拼接传入 CUDA（`matching.py:30-36, 57-67`）。
+- CUDA 侧在当前 `(u,v)` 双线性插值拿到 `r, gx, gy`（`matching_kernels.cu:154-183`），构造 2x2 系统并解 `delta_u, delta_v`（`200-215`），再做 LM 的 `lambda` 调整（`259-268`）。
+
+
 **优势：**
 - 无需相机内参（适用于无标定模式）
 - 利用密集 3D 先验，比纯特征匹配更鲁棒
@@ -418,6 +542,16 @@ def point_to_ray_dist(X, jacobian=False):
         return rd, [dr_dX, dd_dX]
 ```
 
+- [ ] **Question：** 这里的雅可比矩阵是如何推导出来的？T是什么，I又是什么？
+
+- [x] **Answer：**
+`point_to_ray_dist` 中：
+- `d = ||X||`，所以 `dd/dX = X^T / ||X|| = r^T`（代码 `dd_dX = r.unsqueeze(-2)`，`geometry.py:32`）。
+- `r = X / ||X||`，所以  
+  `dr/dX = (1/d) * (I - (X X^T)/d^2)`（代码 `dr_dX`，`geometry.py:29-31`）。
+
+这里的 `I` 是 3x3 单位矩阵（`geometry.py:28`），`T` 是“转置”(transpose)，不是位姿变量 `T_WC` 的那个 `T`。
+
 **2. Sim(3) 作用 (act_Sim3):**
 ```python
 def act_Sim3(T, pC, jacobian=False):
@@ -429,6 +563,16 @@ def act_Sim3(T, pC, jacobian=False):
         dpW_ds = pW              # 尺度部分
         return pW, [dpW_dt, dpW_dR, dpW_ds]
 ```
+
+- [ ] **Question：** 这里的几个梯度是如何推导出来的？
+
+- [x] **Answer：**
+`act_Sim3` 里使用 `pW = s * R * pC + t`，对应 7 维扰动的一阶导：
+- 对平移：`dpW/dt = I`（`geometry.py:49`）。
+- 对旋转李代数小量：`dpW/dtheta = -skew(pW)`（`geometry.py:50`）。
+- 对尺度参数：`dpW/ds = pW`（当前实现参数化下，`geometry.py:51`）。
+
+最终把三部分拼成 3x7 雅可比（`geometry.py:52`），供 `tracker.py` 里链式求导 `J = -d(meas)/dX * dX/dtau` 使用（`tracker.py:192,244`）。
 
 **3. 标定投影 (project_calib):**
 ```python

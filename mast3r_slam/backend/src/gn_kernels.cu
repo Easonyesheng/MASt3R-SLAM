@@ -33,6 +33,30 @@ typedef std::vector<torch::Tensor> tensor_list_t;
 
 #define EPS 1e-6
 
+// -----------------------------------------------------------------------------
+// Overview
+// -----------------------------------------------------------------------------
+// This file implements Gauss-Newton optimization for pose graph alignment on
+// Sim(3), with three measurement models:
+//
+// 1) point_align_kernel : point-to-point residual in 3D
+// 2) ray_align_kernel   : ray+distance residual (no calibration)
+// 3) calib_proj_kernel  : calibrated reprojection + log-depth residual
+//
+// Common pipeline in *_cuda wrappers:
+//   (a) Launch one block per edge, threads accumulate per-point Jacobian terms
+//   (b) Reduce into per-edge Hessian/gradient blocks (Hs, gs)
+//   (c) Assemble sparse normal equation on CPU via Eigen (SparseBlock)
+//   (d) Solve for pose increments dx
+//   (e) Apply Sim(3) retraction on GPU (pose_retr_kernel)
+//
+// Pose parameter layout (Twc row):
+//   [tx, ty, tz, qx, qy, qz, qw, s]   (3 + 4 + 1 = 8)
+//
+// Increment layout (dx row):
+//   [tau(3), omega(3), sigma(1)]      (sim(3) tangent, 7 DoF)
+// -----------------------------------------------------------------------------
+
 __device__ void warpReduce(volatile float *sdata, unsigned int tid) {
   sdata[tid] += sdata[tid + 32];
   sdata[tid] += sdata[tid + 16];
@@ -43,6 +67,8 @@ __device__ void warpReduce(volatile float *sdata, unsigned int tid) {
 }
 
 __device__ void blockReduce(volatile float *sdata) {
+  // In-block reduction helper for THREADS<=256.
+  // sdata is shared memory with one scalar per thread.
   unsigned int tid = threadIdx.x;
   __syncthreads();
 
@@ -69,6 +95,11 @@ class SparseBlock {
         int N, int M) : A(A), b(b), N(N), M(M) {}
 
     void update_lhs(torch::Tensor As, torch::Tensor ii, torch::Tensor jj) {
+      // As: [K, M, M] dense blocks
+      // ii/jj: [K] block row/col indices
+      //
+      // Build sparse matrix A from triplets.
+      // Each block contributes MxM scalar entries.
 
       auto As_cpu = As.to(torch::kCPU).to(torch::kFloat64);
       auto ii_cpu = ii.to(torch::kCPU).to(torch::kInt64);
@@ -96,6 +127,8 @@ class SparseBlock {
     }
 
     void update_rhs(torch::Tensor bs, torch::Tensor ii) {
+      // bs: [K, M], ii: [K]
+      // Accumulate into sparse RHS vector b.
       auto bs_cpu = bs.to(torch::kCPU).to(torch::kFloat64);
       auto ii_cpu = ii.to(torch::kCPU).to(torch::kInt64);
 
@@ -130,6 +163,8 @@ class SparseBlock {
     }
 
     torch::Tensor solve(const float lm=0.0, const float ep=0.0) {
+      // Solve (A + damping) x = b with sparse Cholesky on CPU (Eigen),
+      // then move result back to CUDA tensor.
 
       torch::Tensor dx;
 
@@ -159,11 +194,14 @@ class SparseBlock {
 };
 
 torch::Tensor get_unique_kf_idx(torch::Tensor ii, torch::Tensor jj) {
+  // Return sorted unique pose indices involved in any edge.
   std::tuple<torch::Tensor, torch::Tensor> unique_kf_idx = torch::_unique(torch::cat({ii,jj}), /*sorted=*/ true);
   return std::get<0>(unique_kf_idx);
 }
 
 std::vector<torch::Tensor> create_inds(torch::Tensor unique_kf_idx, const int pin, torch::Tensor ii, torch::Tensor jj) {
+  // Map global keyframe ids (ii,jj) into compact local ids for the solver.
+  // `pin` shifts indices so first `pin` poses become -pin... and are excluded.
   torch::Tensor ii_ind = torch::searchsorted(unique_kf_idx, ii) - pin;
   torch::Tensor jj_ind = torch::searchsorted(unique_kf_idx, jj) - pin;
   return {ii_ind, jj_ind};
@@ -177,6 +215,7 @@ __forceinline__ __device__ float huber(float r) {
 // Returns qi * qj
 __device__ void 
 quat_comp(const float *qi, const float *qj, float *out) {
+  // Quaternion composition (Hamilton product).
   out[0] = qi[3] * qj[0] + qi[0] * qj[3] + qi[1] * qj[2] - qi[2] * qj[1];
   out[1] = qi[3] * qj[1] - qi[0] * qj[2] + qi[1] * qj[3] + qi[2] * qj[0];
   out[2] = qi[3] * qj[2] + qi[0] * qj[1] - qi[1] * qj[0] + qi[2] * qj[3];
@@ -194,6 +233,8 @@ quat_inv(const float *q, float *out) {
 
 __device__ void
 actSO3(const float *q, const float *X, float *Y) {
+  // Rotate vector X by unit quaternion q.
+  // Implemented via cross-product form to avoid explicit matrix construction.
   float uv[3];
   uv[0] = 2.0 * (q[1]*X[2] - q[2]*X[1]);
   uv[1] = 2.0 * (q[2]*X[0] - q[0]*X[2]);
@@ -249,10 +290,14 @@ squared_norm3(const float *v) {
   return v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
 }
 
-__device__ void 
+__device__ void
 relSim3(const float *ti, const float *qi, const float* si,
         const float *tj, const float *qj, const float* sj,
         float *tij, float *qij, float *sij) {
+  // Compute relative transform T_ij = inv(T_i) * T_j in Sim(3):
+  //   s_ij = s_j / s_i
+  //   q_ij = q_i^{-1} * q_j
+  //   t_ij = (1/s_i) * R_i^{-1} * (t_j - t_i)
   
   // 1. Setup scale
   float si_inv = 1.0/si[0];
@@ -276,6 +321,8 @@ relSim3(const float *ti, const float *qi, const float* si,
 // The equivalent is transposing the adjoint and multiplying a column vector
 __device__ void
 apply_Sim3_adj_inv(const float *t, const float *q, const float *s, const float *X, float *Y) {
+  // Transform Jacobian blocks between coordinate frames using Ad_{T}^{-1}.
+  // This is required because residuals are formulated in relative frame C_i.
   // float qinv[4] = {-q[0], -q[1], -q[2], q[3]};
   const float s_inv = 1.0/s[0];
 
@@ -298,7 +345,7 @@ apply_Sim3_adj_inv(const float *t, const float *q, const float *s, const float *
 
 __device__ void
 expSO3(const float *phi, float* q) {
-  // SO3 exponential map
+  // SO(3) exponential map: axis-angle (phi) -> quaternion (q).
   float theta_sq = phi[0]*phi[0] + phi[1]*phi[1] + phi[2]*phi[2];
 
   float imag, real;
@@ -322,6 +369,8 @@ expSO3(const float *phi, float* q) {
 
 __device__ void
 expSim3(const float *xi, float* t, float* q, float* s) {
+  // Sim(3) exponential map from tangent xi=[tau,omega,sigma]
+  // to (t,q,s). Translation uses the Sim(3) left Jacobian-like W matrix.
   float tau[3] = {xi[0], xi[1], xi[2]};
   float phi[3] = {xi[3], xi[4], xi[5]};
   float sigma = xi[6];
@@ -340,8 +389,8 @@ expSim3(const float *xi, float* t, float* q, float* s) {
   float theta_sq = phi[0]*phi[0] + phi[1]*phi[1] + phi[2]*phi[2];
   float theta = sqrtf(theta_sq);
 
-  // Coefficients for W
-  https://github.com/princeton-vl/lietorch/blob/0fa9ce8ffca86d985eca9e189a99690d6f3d4df6/lietorch/include/rxso3.h#L190
+  // Coefficients for W (reference implementation):
+  // https://github.com/princeton-vl/lietorch/blob/0fa9ce8ffca86d985eca9e189a99690d6f3d4df6/lietorch/include/rxso3.h#L190
   
   // TODO: Does this really match equations? Where is scale-1
   float A, B, C;
@@ -392,7 +441,7 @@ expSim3(const float *xi, float* t, float* q, float* s) {
 __device__ void
 retrSim3(const float *xi, const float* t, const float* q, const float* s, float* t1, float* q1, float* s1) {
   
-  // retraction on Sim3 manifold
+  // Retraction on Sim(3): T_new = Exp(xi) * T_old (left update).
   float dt[3] = {0, 0, 0};
   float dq[4] = {0, 0, 0, 1};
   float ds[1] = {0};
@@ -417,6 +466,8 @@ __global__ void pose_retr_kernel(
     const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> dx,
     const int num_fix) 
 {
+  // Apply solved increments dx to all unfixed poses.
+  // One block is enough because #poses is usually small in local BA window.
   const int num_poses = poses.size(0);
 
   for (int k=num_fix+threadIdx.x; k<num_poses; k+=blockDim.x) {
@@ -467,21 +518,27 @@ __global__ void point_align_kernel(
     const float C_thresh,
     const float Q_thresh)
 {
+  // One CUDA block handles one graph edge (i -> j).
+  // Threads inside the block iterate over points on that edge and accumulate:
+  //   - local Hessian blocks H_ii, H_ij, H_ji, H_jj
+  //   - local gradients g_i, g_j
+  //
+  // These per-edge blocks are later assembled into the global sparse system.
  
   // Twc and Xs first dim is number of poses
   // ii, jj, Cii, Cjj, Q first dim is number of edges
  
-  const int block_id = blockIdx.x;
-  const int thread_id = threadIdx.x;
+  const int block_id = blockIdx.x;   // one block == one edge
+  const int thread_id = threadIdx.x; // thread id inside this edge-block
  
-  const int num_points = Xs.size(1);
+  const int num_points = Xs.size(1); // number of point correspondences per edge
  
-  int ix = static_cast<int>(ii[block_id]);
-  int jx = static_cast<int>(jj[block_id]);
+  int ix = static_cast<int>(ii[block_id]); // source pose index i
+  int jx = static_cast<int>(jj[block_id]); // target pose index j
  
-  __shared__ float ti[3], tj[3], tij[3];
-  __shared__ float qi[4], qj[4], qij[4];
-  __shared__ float si[1], sj[1], sij[1];
+  __shared__ float ti[3], tj[3], tij[3]; // translations t_i, t_j, t_ij
+  __shared__ float qi[4], qj[4], qij[4]; // quaternions  q_i, q_j, q_ij
+  __shared__ float si[1], sj[1], sij[1]; // scales       s_i, s_j, s_ij
  
   __syncthreads();
  
@@ -511,9 +568,9 @@ __global__ void point_align_kernel(
   __syncthreads();
  
   // //points
-  float Xi[3];
-  float Xj[3];
-  float Xj_Ci[3];
+  float Xi[3];    // measurement point in frame i
+  float Xj[3];    // source point in frame j
+  float Xj_Ci[3]; // transformed Xj into frame i
  
   // residuals
   float err[3];
@@ -523,8 +580,8 @@ __global__ void point_align_kernel(
   float Jx[14];
   // float Jz;
  
-  float* Ji = &Jx[0];
-  float* Jj = &Jx[7];
+  float* Ji = &Jx[0]; // Jacobian wrt pose i increment (7)
+  float* Jj = &Jx[7]; // Jacobian wrt pose j increment (7)
  
   // hessians
   const int h_dim = 14*(14+1)/2;
@@ -532,7 +589,7 @@ __global__ void point_align_kernel(
  
   float vi[7], vj[7];
  
-  int l; // We reuse this variable later for Hessian fill-in
+  int l; // packed-index cursor for lower-triangular Hessian storage
   for (l=0; l<h_dim; l++) {
     hij[l] = 0;
   }
@@ -543,36 +600,40 @@ __global__ void point_align_kernel(
   }
  
     // Parameters
-  const float sigma_point_inv = 1.0/sigma_point;
+  const float sigma_point_inv = 1.0/sigma_point; // whitening factor
  
   __syncthreads();
  
   GPU_1D_KERNEL_LOOP(k, num_points) {
+    // Each thread processes points k = threadIdx.x, threadIdx.x+blockDim.x, ...
  
     // Get points
-    const bool valid_match_ind = valid_match[block_id][k][0]; 
-    const int64_t ind_Xi = valid_match_ind ? idx_ii2_jj[block_id][k] : 0;
+    const bool valid_match_ind = valid_match[block_id][k][0];   // correspondence exists?
+    const int64_t ind_Xi = valid_match_ind ? idx_ii2_jj[block_id][k] : 0; // matched index in i
 
-    Xi[0] = Xs[ix][ind_Xi][0];
-    Xi[1] = Xs[ix][ind_Xi][1];
-    Xi[2] = Xs[ix][ind_Xi][2];
+    Xi[0] = Xs[ix][ind_Xi][0]; // Xi.x
+    Xi[1] = Xs[ix][ind_Xi][1]; // Xi.y
+    Xi[2] = Xs[ix][ind_Xi][2]; // Xi.z
  
-    Xj[0] = Xs[jx][k][0];
-    Xj[1] = Xs[jx][k][1];
-    Xj[2] = Xs[jx][k][2];
+    Xj[0] = Xs[jx][k][0]; // Xj.x
+    Xj[1] = Xs[jx][k][1]; // Xj.y
+    Xj[2] = Xs[jx][k][2]; // Xj.z
  
     // Transform point
     actSim3(tij, qij, sij, Xj, Xj_Ci);
  
     // Error (difference in camera rays)
-    err[0] = Xj_Ci[0] - Xi[0];
-    err[1] = Xj_Ci[1] - Xi[1];
-    err[2] = Xj_Ci[2] - Xi[2];
+    err[0] = Xj_Ci[0] - Xi[0]; // residual x
+    err[1] = Xj_Ci[1] - Xi[1]; // residual y
+    err[2] = Xj_Ci[2] - Xi[2]; // residual z
  
-    // Weights (Huber)
-    const float q = Q[block_id][k][0];
-    const float ci = Cs[ix][ind_Xi][0];
-    const float cj = Cs[jx][k][0];
+    // Robust confidence weighting:
+    //   valid gate by match/conf thresholds
+    //   confidence scale from Q
+    //   Huber downweight for large residual
+    const float q = Q[block_id][k][0];       // descriptor confidence
+    const float ci = Cs[ix][ind_Xi][0];      // confidence at Xi
+    const float cj = Cs[jx][k][0];           // confidence at Xj
     const bool valid = 
       valid_match_ind
       & (q > Q_thresh)
@@ -580,10 +641,10 @@ __global__ void point_align_kernel(
       & (cj > C_thresh);
 
     // Weight using confidences
-    const float conf_weight = q;
+    const float conf_weight = q; // confidence weight used in this backend
     // const float conf_weight = q * ci * cj;
     
-    const float sqrt_w_point = valid ? sigma_point_inv * sqrtf(conf_weight) : 0;
+    const float sqrt_w_point = valid ? sigma_point_inv * sqrtf(conf_weight) : 0; // sqrt information
  
     // Robust weight
     w[0] = huber(sqrt_w_point * err[0]);
@@ -591,12 +652,13 @@ __global__ void point_align_kernel(
     w[2] = huber(sqrt_w_point * err[2]);
     
     // Add back in sigma
-    const float w_const_point = sqrt_w_point * sqrt_w_point;
+    const float w_const_point = sqrt_w_point * sqrt_w_point; // information (not sqrt)
     w[0] *= w_const_point;
     w[1] *= w_const_point;
     w[2] *= w_const_point;
  
-    // Jacobians
+    // Jacobians wrt Sim(3) increment of pose j in i-frame.
+    // Then map to pose i increment via adjoint and sign flip.
     
     // x coordinate
     Ji[0] = 1.0;
@@ -607,20 +669,20 @@ __global__ void point_align_kernel(
     Ji[5] = -Xj_Ci[1]; // -y
     Ji[6] = Xj_Ci[0]; // x
 
-    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);
-    for (int n=0; n<7; n++) Ji[n] = -Jj[n];
+    apply_Sim3_adj_inv(ti, qi, si, Ji, Jj);      // map Jacobian into world-param space
+    for (int n=0; n<7; n++) Ji[n] = -Jj[n];      // relative residual => opposite sign for i
 
     l=0;
     for (int n=0; n<14; n++) {
       for (int m=0; m<=n; m++) {
-        hij[l] += w[0] * Jx[n] * Jx[m];
+        hij[l] += w[0] * Jx[n] * Jx[m]; // accumulate Hessian entry
         l++;
       }
     }
  
     for (int n=0; n<7; n++) {
-      vi[n] += w[0] * err[0] * Ji[n];
-      vj[n] += w[0] * err[0] * Jj[n];
+      vi[n] += w[0] * err[0] * Ji[n]; // accumulate gradient for pose i
+      vj[n] += w[0] * err[0] * Jj[n]; // accumulate gradient for pose j
     }
  
     // y coordinate
@@ -679,6 +741,7 @@ __global__ void point_align_kernel(
   __syncthreads();
  
   __shared__ float sdata[THREADS];
+  // Reduce per-thread partial sums to one value per block.
   for (int n=0; n<7; n++) {
     sdata[threadIdx.x] = vi[n];
     blockReduce(sdata);
@@ -733,6 +796,8 @@ std::vector<torch::Tensor> gauss_newton_points_cuda(
   const int max_iter,
   const float delta_thresh)
 {
+  // Gauss-Newton outer loop for point residual model.
+  // Solves only poses (point coordinates are fixed measurements here).
   auto opts = Twc.options();
   const int num_edges = ii.size(0);
   const int num_poses = Xs.size(0);
@@ -763,6 +828,7 @@ std::vector<torch::Tensor> gauss_newton_points_cuda(
   torch::Tensor delta_norm;
 
   for (int itr=0; itr<max_iter; itr++) {
+    // 1) Build edge-wise normal-equation terms on GPU.
 
     point_align_kernel<<<num_edges, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
@@ -779,7 +845,7 @@ std::vector<torch::Tensor> gauss_newton_points_cuda(
     );
 
 
-    // pose x pose block
+    // 2) Assemble global sparse normal equations (A dx = -g).
     SparseBlock A(num_poses - num_fix, pose_dim);
 
     A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
@@ -789,7 +855,7 @@ std::vector<torch::Tensor> gauss_newton_points_cuda(
     A.update_rhs(gs.reshape({-1, pose_dim}), 
         torch::cat({ii_opt, jj_opt}));
 
-    // NOTE: Accounting for negative here!
+    // 3) Solve and negate because kernel accumulates +J^T r.
     dx = -A.solve();
     
     pose_retr_kernel<<<1, THREADS>>>(
@@ -797,7 +863,7 @@ std::vector<torch::Tensor> gauss_newton_points_cuda(
       dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       num_fix);
 
-    // Termination criteria
+    // 4) Stop when update magnitude is small.
     // Need to specify this second argument otherwise ambiguous function call...
     delta_norm = torch::linalg::linalg_norm(dx, std::optional<c10::Scalar>(), {}, false, {});
     if (delta_norm.item<float>() < delta_thresh) {
@@ -826,17 +892,26 @@ __global__ void ray_align_kernel(
     const float C_thresh,
     const float Q_thresh)
 {
+  // Same structure as point_align_kernel, but residual is:
+  //   e = [ ray(X_j in i) - ray(X_i),  ||X_j in i|| - ||X_i|| ]
+  // (3 ray components + 1 distance component).
+  //
+  // This is used when camera intrinsics are unavailable.
+  //
+  // Reading note:
+  // - variable loading / indexing lines are identical to point_align_kernel
+  // - only residual/Jacobian definitions differ (ray normalization + distance)
  
   // Twc and Xs first dim is number of poses
   // ii, jj, Cii, Cjj, Q first dim is number of edges
  
-  const int block_id = blockIdx.x;
-  const int thread_id = threadIdx.x;
+  const int block_id = blockIdx.x;   // one block == one edge
+  const int thread_id = threadIdx.x; // thread id inside this edge-block
  
-  const int num_points = Xs.size(1);
+  const int num_points = Xs.size(1); // number of correspondences on this edge
  
-  int ix = static_cast<int>(ii[block_id]);
-  int jx = static_cast<int>(jj[block_id]);
+  int ix = static_cast<int>(ii[block_id]); // edge source pose i
+  int jx = static_cast<int>(jj[block_id]); // edge target pose j
  
   __shared__ float ti[3], tj[3], tij[3];
   __shared__ float qi[4], qj[4], qij[4];
@@ -922,9 +997,9 @@ __global__ void ray_align_kernel(
     Xj[2] = Xs[jx][k][2];
  
     // Normalize measurement point
-    const float norm2_i = squared_norm3(Xi);
-    const float norm1_i = sqrtf(norm2_i);
-    const float norm1_i_inv = 1.0/norm1_i;    
+    const float norm2_i = squared_norm3(Xi); // ||Xi||^2
+    const float norm1_i = sqrtf(norm2_i);    // ||Xi||
+    const float norm1_i_inv = 1.0/norm1_i;   // 1/||Xi||
     
     float ri[3];
     for (int i=0; i<3; i++) ri[i] = norm1_i_inv * Xi[i];
@@ -933,18 +1008,18 @@ __global__ void ray_align_kernel(
     actSim3(tij, qij, sij, Xj, Xj_Ci);
  
     // Get predicted point norm
-    const float norm2_j = squared_norm3(Xj_Ci);
-    const float norm1_j = sqrtf(norm2_j);
-    const float norm1_j_inv = 1.0/norm1_j;
+    const float norm2_j = squared_norm3(Xj_Ci); // ||Xj_Ci||^2
+    const float norm1_j = sqrtf(norm2_j);       // ||Xj_Ci||
+    const float norm1_j_inv = 1.0/norm1_j;      // 1/||Xj_Ci||
 
     float rj_Ci[3];
     for (int i=0; i<3; i++) rj_Ci[i] = norm1_j_inv * Xj_Ci[i];
  
     // Error (difference in camera rays)
-    err[0] = rj_Ci[0] - ri[0];
-    err[1] = rj_Ci[1] - ri[1];
-    err[2] = rj_Ci[2] - ri[2];
-    err[3] = norm1_j - norm1_i; // Distance
+    err[0] = rj_Ci[0] - ri[0];    // ray residual x
+    err[1] = rj_Ci[1] - ri[1];    // ray residual y
+    err[2] = rj_Ci[2] - ri[2];    // ray residual z
+    err[3] = norm1_j - norm1_i;   // distance residual
  
     // Weights (Huber)
     const float q = Q[block_id][k][0];
@@ -960,8 +1035,8 @@ __global__ void ray_align_kernel(
     const float conf_weight = q;
     // const float conf_weight = q * ci * cj;
     
-    const float sqrt_w_ray = valid ? sigma_ray_inv * sqrtf(conf_weight) : 0;
-    const float sqrt_w_dist = valid ? sigma_dist_inv * sqrtf(conf_weight) : 0;
+    const float sqrt_w_ray = valid ? sigma_ray_inv * sqrtf(conf_weight) : 0;   // sqrt info for ray terms
+    const float sqrt_w_dist = valid ? sigma_dist_inv * sqrtf(conf_weight) : 0; // sqrt info for distance term
  
     // Robust weight
     w[0] = huber(sqrt_w_ray * err[0]);
@@ -977,9 +1052,9 @@ __global__ void ray_align_kernel(
     w[2] *= w_const_ray;
     w[3] *= w_const_dist;
  
-    // Jacobians
+    // Jacobians for ray normalization + distance term wrt Sim(3) increment.
     
-    const float norm3_j_inv = norm1_j_inv / norm2_j;
+    const float norm3_j_inv = norm1_j_inv / norm2_j; // == 1 / ||Xj_Ci||^3
     const float drx_dPx = norm1_j_inv - Xj_Ci[0]*Xj_Ci[0]*norm3_j_inv;
     const float dry_dPy = norm1_j_inv - Xj_Ci[1]*Xj_Ci[1]*norm3_j_inv;
     const float drz_dPz = norm1_j_inv - Xj_Ci[2]*Xj_Ci[2]*norm3_j_inv;
@@ -1149,6 +1224,7 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   const int max_iter,
   const float delta_thresh)
 {
+  // Gauss-Newton outer loop for ray-distance residual model.
   auto opts = Twc.options();
   const int num_edges = ii.size(0);
   const int num_poses = Xs.size(0);
@@ -1179,6 +1255,7 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
   torch::Tensor delta_norm;
 
   for (int itr=0; itr<max_iter; itr++) {
+    // 1) Build edge-wise normal-equation terms on GPU.
 
     ray_align_kernel<<<num_edges, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
@@ -1195,7 +1272,7 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
     );
 
 
-    // pose x pose block
+    // 2) Assemble global sparse normal equations (A dx = -g).
     SparseBlock A(num_poses - num_fix, pose_dim);
 
     A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
@@ -1205,16 +1282,16 @@ std::vector<torch::Tensor> gauss_newton_rays_cuda(
     A.update_rhs(gs.reshape({-1, pose_dim}), 
         torch::cat({ii_opt, jj_opt}));
 
-    // NOTE: Accounting for negative here!
+    // 3) Solve and negate because kernel accumulates +J^T r.
     dx = -A.solve();
 
-    //
+    // Apply update to unfixed poses.
     pose_retr_kernel<<<1, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       num_fix);
 
-    // Termination criteria
+    // 4) Stop when update magnitude is small.
     // Need to specify this second argument otherwise ambiguous function call...
     delta_norm = torch::linalg::linalg_norm(dx, std::optional<c10::Scalar>(), {}, false, {});
     if (delta_norm.item<float>() < delta_thresh) {
@@ -1249,17 +1326,26 @@ __global__ void calib_proj_kernel(
     const float C_thresh,
     const float Q_thresh)
 {
+  // Calibrated reprojection residual:
+  //   e = [u_pred - u_obs, v_pred - v_obs, log(z_pred) - log(z_obs)]
+  // with visibility checks (depth and image bounds).
+  //
+  // One block per edge, same reduction/assembly strategy as above.
+  //
+  // Reading note:
+  // - indexing/pose loading/reduction steps are same as point_align_kernel
+  // - this kernel differs in projection model and Jacobian wrt (u,v,log z)
  
   // Twc and Xs first dim is number of poses
   // ii, jj, Cii, Cjj, Q first dim is number of edges
  
-  const int block_id = blockIdx.x;
-  const int thread_id = threadIdx.x;
+  const int block_id = blockIdx.x;   // one block == one edge
+  const int thread_id = threadIdx.x; // thread id inside this edge-block
  
-  const int num_points = Xs.size(1);
+  const int num_points = Xs.size(1); // number of correspondences for this edge
  
-  int ix = static_cast<int>(ii[block_id]);
-  int jx = static_cast<int>(jj[block_id]);
+  int ix = static_cast<int>(ii[block_id]); // edge source pose i
+  int jx = static_cast<int>(jj[block_id]); // edge target pose j
 
   __shared__ float fx;
   __shared__ float fy;
@@ -1272,10 +1358,10 @@ __global__ void calib_proj_kernel(
 
   // load intrinsics from global memory
   if (thread_id == 0) {
-    fx = K[0][0];
-    fy = K[1][1];
-    cx = K[0][2];
-    cy = K[1][2];
+    fx = K[0][0]; // focal length x
+    fy = K[1][1]; // focal length y
+    cx = K[0][2]; // principal point x
+    cy = K[1][2]; // principal point y
   }
  
   __syncthreads();
@@ -1358,34 +1444,34 @@ __global__ void calib_proj_kernel(
     Xj[2] = Xs[jx][k][2];
 
     // Get measurement pixel
-    const int u_target = ind_Xi % width; 
-    const int v_target = ind_Xi / width;
+    const int u_target = ind_Xi % width; // observed pixel x in frame i
+    const int v_target = ind_Xi / width; // observed pixel y in frame i
  
     // Transform point
     actSim3(tij, qij, sij, Xj, Xj_Ci);
 
     // // Check if in front of camera
-    const bool valid_z = ((Xj_Ci[2] > z_eps) && (Xi[2] > z_eps));
+    const bool valid_z = ((Xj_Ci[2] > z_eps) && (Xi[2] > z_eps)); // both depths must be positive
 
     // Handle depth related vars
-    const float zj_inv = valid_z ? 1.0/Xj_Ci[2] : 0.0;
-    const float zj_log = valid_z ? logf(Xj_Ci[2]) : 0.0;
-    const float zi_log = valid_z ? logf(Xi[2]) : 0.0; 
+    const float zj_inv = valid_z ? 1.0/Xj_Ci[2] : 0.0; // inverse predicted depth
+    const float zj_log = valid_z ? logf(Xj_Ci[2]) : 0.0; // predicted log-depth
+    const float zi_log = valid_z ? logf(Xi[2]) : 0.0;    // observed log-depth
 
     // Project point
-    const float x_div_z = Xj_Ci[0] * zj_inv;
-    const float y_div_z = Xj_Ci[1] * zj_inv;
-    const float u = fx * x_div_z + cx;
-    const float v = fy * y_div_z + cy;
+    const float x_div_z = Xj_Ci[0] * zj_inv; // normalized x
+    const float y_div_z = Xj_Ci[1] * zj_inv; // normalized y
+    const float u = fx * x_div_z + cx;       // predicted pixel x
+    const float v = fy * y_div_z + cy;       // predicted pixel y
 
     // Handle proj
     const bool valid_u = ((u > pixel_border) && (u < width - 1 - pixel_border));
     const bool valid_v = ((v > pixel_border) && (v < height - 1 - pixel_border));
 
     // Error (difference in camera rays)
-    err[0] = u - u_target;
-    err[1] = v - v_target;
-    err[2] = zj_log - zi_log; // Log-depth
+    err[0] = u - u_target;      // reprojection residual x
+    err[1] = v - v_target;      // reprojection residual y
+    err[2] = zj_log - zi_log;   // log-depth residual
 
     // Weights (Huber)
     const float q = Q[block_id][k][0];
@@ -1401,8 +1487,8 @@ __global__ void calib_proj_kernel(
     // Weight using confidences
     const float conf_weight = q;
     
-    const float sqrt_w_pixel = valid ? sigma_pixel_inv * sqrtf(conf_weight) : 0;
-    const float sqrt_w_depth = valid ? sigma_depth_inv * sqrtf(conf_weight) : 0;
+    const float sqrt_w_pixel = valid ? sigma_pixel_inv * sqrtf(conf_weight) : 0; // sqrt info for pixel terms
+    const float sqrt_w_depth = valid ? sigma_depth_inv * sqrtf(conf_weight) : 0; // sqrt info for depth term
 
     // Robust weight
     w[0] = huber(sqrt_w_pixel * err[0]);
@@ -1416,7 +1502,7 @@ __global__ void calib_proj_kernel(
     w[1] *= w_const_pixel;
     w[2] *= w_const_depth;
 
-    // Jacobians    
+    // Jacobians wrt Sim(3) increment (u, v, log z channels).
 
     // x coordinate
     Ji[0] = fx * zj_inv;
@@ -1558,6 +1644,7 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
   const int max_iter,
   const float delta_thresh)
 {
+  // Gauss-Newton outer loop for calibrated projection residual model.
   auto opts = Twc.options();
   const int num_edges = ii.size(0);
   const int num_poses = Xs.size(0);
@@ -1588,6 +1675,7 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
   torch::Tensor delta_norm;
 
   for (int itr=0; itr<max_iter; itr++) {
+    // 1) Build edge-wise normal-equation terms on GPU.
 
     calib_proj_kernel<<<num_edges, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
@@ -1605,7 +1693,7 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
     );
 
 
-    // pose x pose block
+    // 2) Assemble global sparse normal equations (A dx = -g).
     SparseBlock A(num_poses - num_fix, pose_dim);
 
     A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
@@ -1615,16 +1703,16 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
     A.update_rhs(gs.reshape({-1, pose_dim}), 
         torch::cat({ii_opt, jj_opt}));
 
-    // NOTE: Accounting for negative here!
+    // 3) Solve and negate because kernel accumulates +J^T r.
     dx = -A.solve();
 
-    
+    // Apply update to unfixed poses.
     pose_retr_kernel<<<1, THREADS>>>(
       Twc.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       dx.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
       num_fix);
 
-    // Termination criteria
+    // 4) Stop when update magnitude is small.
     // Need to specify this second argument otherwise ambiguous function call...
     delta_norm = torch::linalg::linalg_norm(dx, std::optional<c10::Scalar>(), {}, false, {});
     if (delta_norm.item<float>() < delta_thresh) {
