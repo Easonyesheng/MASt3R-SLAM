@@ -6,6 +6,14 @@ import mast3r_slam_backends
 
 
 def match(X11, X21, D11, D21, idx_1_to_2_init=None):
+    """
+    Args:
+        X11: (b,h,w,3) 参考帧的点云
+        X21: (b,h,w,3) 待匹配帧的点云
+        D11: (b,h,w,c) 参考帧的特征描述子
+        D21: (b,h,w,c) 待匹配帧的特征描述子
+        idx_1_to_2_init: (b,hw) 可选
+    """
     idx_1_to_2, valid_match2 = match_iterative_proj(X11, X21, D11, D21, idx_1_to_2_init)
     return idx_1_to_2, valid_match2
 
