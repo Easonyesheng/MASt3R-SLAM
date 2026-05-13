@@ -39,6 +39,8 @@ class Frame:
         return score
 
     def update_pointmap(self, X: torch.Tensor, C: torch.Tensor):
+        """ The pointmap of the frame is always in canonical space
+        """
         filtering_mode = config["tracking"]["filtering_mode"]
 
         if self.N == 0:

@@ -38,9 +38,10 @@ class FrameTracker:
         idx_f2k = idx_f2k[0]
         valid_match_k = valid_match_k[0]
 
-        Qk = torch.sqrt(Qff[idx_f2k] * Qkf)
+        Qk = torch.sqrt(Qff[idx_f2k] * Qkf) # Qk comes from the confidence of descriptor
 
-        # Update keyframe pointmap after registration (need pose)
+        # Update current frame pointmap after MASt3R inference (no pose needed)
+        # The keyframe pointmap is updated later after pose is estimated.
         frame.update_pointmap(Xff, Cff)
 
         use_calib = config["use_calib"]
@@ -53,22 +54,24 @@ class FrameTracker:
         # Get poses and point correspondneces and confidences
         Xf, Xk, T_WCf, T_WCk, Cf, Ck, meas_k, valid_meas_k = self.get_points_poses(
             frame, keyframe, idx_f2k, img_size, use_calib, K
-        )
+        ) # here Xf and Xk are the corresponding points with the same image size
 
         # Get valid
         # Use canonical confidence average
-        valid_Cf = Cf > self.cfg["C_conf"]
-        valid_Ck = Ck > self.cfg["C_conf"]
-        valid_Q = Qk > self.cfg["Q_conf"]
+        valid_Cf = Cf > self.cfg["C_conf"] # confidence of the current frame points
+        valid_Ck = Ck > self.cfg["C_conf"] # confidence of the keyframe points
+        valid_Q = Qk > self.cfg["Q_conf"] # confidence of the descriptor matching
 
-        valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q
+        valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q 
+        # both points of two sides need to be confident and the descriptor matching needs to be confident for optimization, used for pose estimation
         valid_kf = valid_match_k & valid_Q
 
-        match_frac = valid_opt.sum() / valid_opt.numel()
+        match_frac = valid_opt.sum() / valid_opt.numel() # match frac of the points that are valid for optimization, used for keyframe selection and failure detection
         if match_frac < self.cfg["min_match_frac"]:
             print(f"Skipped frame {frame.frame_id}")
             return False, [], True
 
+        # perform optimization to get the pose of the current frame, if fails, return failure signal to caller, the caller can then decide to keep previous state or trigger relocalization/new keyframe logic
         try:
             # Track
             if not use_calib:
@@ -90,6 +93,8 @@ class FrameTracker:
                 )
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
+            # If optimization fails, skip this frame and signal failure to the caller.
+            # The caller can then keep the previous state or trigger relocalization/new keyframe logic.
             return False, [], True
 
         frame.T_WC = T_WCf
@@ -127,6 +132,8 @@ class FrameTracker:
         )
 
     def get_points_poses(self, frame, keyframe, idx_f2k, img_size, use_calib, K=None):
+        """ only get the points and poses, no optimization here, just data prep for optimization
+        """
         Xf = frame.X_canon
         Xk = keyframe.X_canon
         T_WCf = frame.T_WC
@@ -154,6 +161,9 @@ class FrameTracker:
         return Xf[idx_f2k], Xk, T_WCf, T_WCk, Cf[idx_f2k], Ck, meas_k, valid_meas_k
 
     def solve(self, sqrt_info, r, J):
+        """
+        Solve the linear system using Cholesky decomposition
+        """
         whitened_r = sqrt_info * r
         robust_sqrt_info = sqrt_info * torch.sqrt(
             huber(whitened_r, k=self.cfg["huber"])
