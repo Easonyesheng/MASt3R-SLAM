@@ -163,6 +163,7 @@ class FrameTracker:
     def solve(self, sqrt_info, r, J):
         """
         Solve the linear system using Cholesky decomposition
+        the equation is (J'*W*J) * tau = -J'*W*r, also H * tau = g
         """
         whitened_r = sqrt_info * r
         robust_sqrt_info = sqrt_info * torch.sqrt(
@@ -173,7 +174,7 @@ class FrameTracker:
         b = (robust_sqrt_info * r).view(-1, 1)  # z-h
         H = A.T @ A
         g = -A.T @ b
-        cost = 0.5 * (b.T @ b).item()
+        cost = 0.5 * (b.T @ b).item() # cost is used for convergence check
 
         L = torch.linalg.cholesky(H, upper=False)
         tau_j = torch.cholesky_solve(g, L, upper=False).view(1, -1)
@@ -226,6 +227,19 @@ class FrameTracker:
     def opt_pose_calib_sim3(
         self, Xf, Xk, T_WCf, T_WCk, Qk, valid, meas_k, valid_meas_k, K, img_size
     ):
+        """
+        Args:
+            Xf: (N, 3) points in the current frame
+            Xk: (N, 3) points in the keyframe
+            T_WCf: (4, 4) current frame pose
+            T_WCk: (4, 4) keyframe pose
+            Qk: (N,) confidence of the descriptor matching
+            valid: (N,) boolean mask of valid points for optimization
+            meas_k: (N, 3) measurement in pixel coordinates and log depth for the keyframe points
+            valid_meas_k: (N, 1) boolean mask of valid measurements (e.g. positive depth)
+            K: (3, 3) camera intrinsic matrix
+            img_size: (H, W) image size for projection constraints
+        """
         last_error = 0
         sqrt_info_pixel = 1 / self.cfg["sigma_pixel"] * valid * torch.sqrt(Qk)
         sqrt_info_depth = 1 / self.cfg["sigma_depth"] * valid * torch.sqrt(Qk)
@@ -244,12 +258,12 @@ class FrameTracker:
                 jacobian=True,
                 border=self.cfg["pixel_border"],
                 z_eps=self.cfg["depth_eps"],
-            )
+            ) # use depth of Xf
             valid2 = valid_proj & valid_meas_k
             sqrt_info2 = valid2 * sqrt_info
 
             # r = z-h(x)
-            r = meas_k - pzf_Ck
+            r = meas_k - pzf_Ck # only optimize the depth
             # Jacobian
             J = -dpzf_Ck_dXf_Ck @ dXf_Ck_dT_CkCf
 

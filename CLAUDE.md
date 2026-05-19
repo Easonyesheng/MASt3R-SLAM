@@ -33,20 +33,29 @@ MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl
 ## Running the System
 
 ```bash
-# Standard run (known calibration)
+# Standard run (known calibration) — multi-process interactive
 python main.py --dataset <path> --config config/calib.yaml
 
-# Without calibration
+# Without calibration — multi-process interactive
 python main.py --dataset <path> --config config/base.yaml
 
 # With custom intrinsics file
 python main.py --dataset <path> --config config/base.yaml --calib config/intrinsics.yaml
 
-# Headless evaluation
+# Headless evaluation — single-threaded
 python main.py --dataset <path> --no-viz --save-as <savedir> --config config/eval_calib.yaml
 ```
 
+Interactive configs (`calib.yaml`, `base.yaml`) run the backend and viz in separate processes. Evaluation configs (`eval_calib.yaml`, `eval_no_calib.yaml`) set `single_thread: True`, which makes the main process wait for the backend to finish each global optimization before proceeding — this is important for reproducible evaluation.
+
 Dataset download and batch evaluation scripts are in `scripts/`.
+
+### Windows / WSL
+
+On WSL, the shared-memory multiprocessing causes issues. Check out the `windows` branch which disables multiprocessing:
+```bash
+git checkout windows
+```
 
 ## Architecture
 
@@ -107,6 +116,34 @@ Iterative projective matching of MASt3R pointmaps in ray space. Uses the CUDA ba
 ### Configuration System (`config.py`)
 
 YAML-based with `inherit` support (e.g., `config/calib.yaml` inherits `config/base.yaml`). A global `config` dict is set once at startup and read throughout the codebase via `from mast3r_slam.config import config`.
+
+Key config sections in `base.yaml`:
+- **`matching`**: Projective matching parameters (iterations, convergence, radius, pixel dilation)
+- **`tracking`**: Frame-to-keyframe tracking — min match ratio, Gauss-Newton iteration limits, confidence thresholds (`C_conf`, `Q_conf`), robust sigma values for ray/pixel/depth/point errors, `filtering_mode` for pointmap merging strategy
+- **`local_opt`**: Global bundle adjustment — number of pinned keyframes (`pin`), window size, matching thresholds, `use_cuda` toggle for C++ backend
+- **`retrieval`**: Retrieval database — `k` nearest neighbors, minimum similarity threshold
+- **`reloc`**: Relocalization — minimum match fraction, strict matching toggle
+
+### Visualization (`visualization.py`)
+
+The 3D viewer renders the point cloud, camera trajectory, and current frame. User controls through the viz window:
+- **Pause/Resume**: Freezes tracking; frames are still processed when you step
+- **Step**: Advance one frame while paused
+- **Terminate/X**: Shuts down the entire system
+
+These are communicated back to the main process via `WindowMsg` through the `viz2main` queue.
+
+### Robust Optimization (`nonlinear_optimizer.py`)
+
+Provides Huber and Tukey robust cost function weights, plus `check_convergence()` for relative cost decrease and delta-norm thresholds. Used by both the tracking's Sim(3) optimization and the global bundle adjustment.
+
+### Multiprocess Utilities (`multiprocess_utils.py`)
+
+When `--no-viz` is passed, `new_queue()` returns a `FakeQueue` that silently discards all messages — this allows the same main-loop code to run without a viz process. `try_get_msg()` provides non-blocking queue reads.
+
+### Evaluation Output (`evaluate.py`)
+
+Post-run export: saves camera trajectory as a TUM-format text file (timestamps + SE3 poses), exports a dense point cloud as PLY (applying C_conf threshold for filtering), and writes keyframe images. Uses the `plyfile` library and converts Sim(3) poses to SE3 via `lietorch_utils.as_SE3()`.
 
 ### Datasets (`dataloader.py`)
 
