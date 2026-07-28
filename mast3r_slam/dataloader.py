@@ -325,7 +325,7 @@ def load_dataset(dataset_path):
         return EurocDataset(dataset_path)
     if "eth3d" in split_dataset_type:
         return ETH3DDataset(dataset_path)
-    if "7-scenes" in split_dataset_type:
+    if "7-scenes" in split_dataset_type or "7Scenes" in split_dataset_type:
         return SevenScenesDataset(dataset_path)
     if "realsense" in split_dataset_type:
         return RealsenseDataset()

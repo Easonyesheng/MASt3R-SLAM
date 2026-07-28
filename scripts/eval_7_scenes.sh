@@ -1,16 +1,24 @@
 #!/bin/bash
-dataset_path="datasets/7-scenes/"
+###
+ # @Author: Easonyesheng preacher@sjtu.edu.cn
+ # @Date: 2026-04-21 15:44:00
+ # @LastEditors: Easonyesheng preacher@sjtu.edu.cn
+ # @LastEditTime: 2026-05-26 15:38:30
+ # @FilePath: /recon/ee_recon/third_party/MASt3R-SLAM/scripts/eval_7_scenes.sh
+ # @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+### 
+dataset_path="/opt/data/private/datasets/NVS/7Scenes/"
 datasets=(
     chess
-    fire
-    heads
-    office
-    pumpkin
-    redkitchen
-    stairs
+    # fire
+    # heads
+    # office
+    # pumpkin
+    # redkitchen
+    # stairs
 )
 
-no_calib=false
+no_calib=true
 print_only=false
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
