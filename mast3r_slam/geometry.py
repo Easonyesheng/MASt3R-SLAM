@@ -15,7 +15,7 @@ def point_to_dist(X):
 
 
 def point_to_ray_dist(X, jacobian=False):
-    b = X.shape[:-1]
+    b = X.shape[:-1] # X is (B, N, 3) or (N, 3)
 
     d = point_to_dist(X)
     d_inv = 1.0 / d

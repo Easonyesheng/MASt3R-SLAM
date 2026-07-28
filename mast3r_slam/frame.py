@@ -25,9 +25,9 @@ class Frame:
     X_canon: Optional[torch.Tensor] = None
     C: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
-    pos: Optional[torch.Tensor] = None
-    N: int = 0
-    N_updates: int = 0
+    pos: Optional[torch.Tensor] = None # pos is the pixel coordinate of the feature, used for visualization and matching
+    N: int = 0 # N is the number of times the pointmap has been updated, used for filtering
+    N_updates: int = 0 # N_updates is the total number of times the pointmap has been updated, used for filtering
     K: Optional[torch.Tensor] = None
 
     def get_score(self, C):
@@ -39,6 +39,8 @@ class Frame:
         return score
 
     def update_pointmap(self, X: torch.Tensor, C: torch.Tensor):
+        """ The pointmap of the frame is always in canonical space
+        """
         filtering_mode = config["tracking"]["filtering_mode"]
 
         if self.N == 0:
